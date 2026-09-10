@@ -72,16 +72,17 @@ public class CommentController {
     // ==================== 管理员审核接口 ====================
 
     /**
-     * 管理员查询全部评论(支持按景点/用户筛选)
+     * 管理员查询全部评论(支持按景点名称/景点ID/用户ID筛选)
      * GET /api/comment/all
      */
     @GetMapping("/all")
     public Result<Page<CommentResponse>> listAll(
             @RequestParam(required = false) Integer spotId,
+            @RequestParam(required = false) String spotName,
             @RequestParam(required = false) Integer userId,
             @RequestParam(defaultValue = "1") Long current,
             @RequestParam(defaultValue = "10") Long size) {
-        Page<CommentResponse> page = commentService.listAll(spotId, userId, current, size);
+        Page<CommentResponse> page = commentService.listAll(spotId, spotName, userId, current, size);
         return Result.success(page);
     }
 

@@ -1,6 +1,7 @@
 package com.tourism.service;
 
 import com.tourism.dto.request.SpotQueryRequest;
+import com.tourism.dto.response.ClusterAnalysisResponse;
 import com.tourism.dto.response.KpiResponse;
 import com.tourism.dto.response.PriceScoreResponse;
 import com.tourism.dto.response.ProvinceStackResponse;
@@ -77,5 +78,15 @@ public interface StatService {
      * @return KPI聚合数据
      */
     KpiResponse kpiOverview(SpotQueryRequest query);
+
+    /**
+     * K-Means聚类分析(无监督学习): 以(门票价格,评分)两维为特征,
+     * 用K-Means算法将景点划分为K个簇, 用于大屏聚类散点图
+     * @param query 查询条件(支持省份、类型筛选)
+     * @param sampleSize 参与聚类的随机采样样本数
+     * @param k 聚类簇数
+     * @return 聚类点 + 中心点 + 各簇规模
+     */
+    ClusterAnalysisResponse clusterAnalysis(SpotQueryRequest query, Integer sampleSize, Integer k);
 }
 

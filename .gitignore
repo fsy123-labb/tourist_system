@@ -24,3 +24,8 @@ Desktop.ini
 
 # Logs
 *.log
+
+# 论文/文档材料(不入代码仓库)
+_report_work/
+课程实训报告-基于大数据的全国旅游景点信息管理系统.docx
+后端代码附录.md

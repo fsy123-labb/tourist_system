@@ -20,9 +20,9 @@
       </template>
 
       <div class="search-bar">
-        <el-input v-model="filterForm.spotId" placeholder="景点ID" style="width: 140px" clearable :prefix-icon="Location" />
-        <el-input v-model="filterForm.userId" placeholder="用户ID" style="width: 140px" clearable :prefix-icon="User" />
-        <el-button type="primary" :icon="Search" @click="loadData">筛选</el-button>
+        <el-input v-model="filterForm.spotName" placeholder="景点名称" style="width: 160px" clearable :prefix-icon="Location" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-input v-model="filterForm.userId" placeholder="用户ID(数字)" style="width: 150px" clearable :prefix-icon="User" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-button type="primary" :icon="Search" @click="handleSearch">筛选</el-button>
         <el-button :icon="Refresh" @click="handleReset">重置</el-button>
       </div>
 
@@ -77,13 +77,24 @@ import { getAllComments, adminDeleteComment } from '@/api/comment.js'
 const loading = ref(false)
 const tableData = ref([])
 const page = reactive({ current: 1, size: 10, total: 0 })
-const filterForm = reactive({ spotId: '', userId: '' })
+const filterForm = reactive({ spotName: '', userId: '' })
+
+// 筛选: 用户ID仅允许数字, 非数字时提示且不发起请求(避免后端类型转换异常)
+function handleSearch() {
+  const uid = (filterForm.userId || '').trim()
+  if (uid && !/^\d+$/.test(uid)) {
+    ElMessage.warning('用户ID请输入数字')
+    return
+  }
+  page.current = 1
+  loadData()
+}
 
 async function loadData() {
   loading.value = true
   try {
     const res = await getAllComments({
-      spotId: filterForm.spotId || undefined,
+      spotName: filterForm.spotName || undefined,
       userId: filterForm.userId || undefined,
       current: page.current, size: page.size
     })
@@ -94,7 +105,7 @@ async function loadData() {
 }
 
 function handleReset() {
-  filterForm.spotId = ''; filterForm.userId = ''
+  filterForm.spotName = ''; filterForm.userId = ''
   page.current = 1; loadData()
 }
 

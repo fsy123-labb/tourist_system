@@ -98,3 +98,15 @@ export function getKpiOverview(params) {
     params
   })
 }
+
+/**
+ * K-Means聚类分析(景点按价格-评分无监督聚类)
+ * @param params { sampleSize, k, ...筛选条件 }
+ */
+export function getClusterAnalysis(params) {
+  return request({
+    url: '/api/stat/clusterAnalysis',
+    method: 'get',
+    params
+  })
+}

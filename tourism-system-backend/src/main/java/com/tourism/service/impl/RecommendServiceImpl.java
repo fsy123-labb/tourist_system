@@ -88,59 +88,8 @@ public class RecommendServiceImpl implements RecommendService {
      */
     @Override
     public List<RecommendItemResponse> similarSpots(Integer spotId, Integer topN) {
-        // 1. 加载全量景点 + 城市映射(用于补充省份/城市信息)
-        List<ScenicSpot> allSpots = scenicSpotMapper.selectList(null);
-        Map<Integer, String[]> cityMap = loadCityMap(); // cityId -> [province, city]
-
-        // 找到目标景点
-        ScenicSpot target = null;
-        Map<Integer, ScenicSpot> spotMap = new HashMap<>();
-        for (ScenicSpot s : allSpots) {
-            spotMap.put(s.getId(), s);
-            if (s.getId().equals(spotId)) {
-                target = s;
-            }
-        }
-        if (target == null) {
-            return Collections.emptyList();
-        }
-
-        // 2. 预计算目标景点的特征向量和文本词集
-        double[] targetVec = buildFeatureVector(target);
-        Set<String> targetTokens = tokenize(target.getSpotIntro());
-        String targetProvince = getProvince(target.getCityId(), cityMap);
-
-        // 3. 加载协同过滤数据: spotId -> 浏览过该景点的用户集合
-        Map<Integer, Set<Integer>> spotUsersMap = loadSpotUsersMap();
-        Set<Integer> targetUsers = spotUsersMap.getOrDefault(spotId, Collections.emptySet());
-
-        // 4. 遍历全量景点, 计算混合相似度
-        List<RecommendItemResponse> result = new ArrayList<>();
-        for (ScenicSpot candidate : allSpots) {
-            // 排除自身
-            if (candidate.getId().equals(spotId)) {
-                continue;
-            }
-            // 内容相似度
-            double contentSim = contentSimilarity(candidate, targetVec, targetTokens,
-                    targetProvince, cityMap);
-            // 协同过滤相似度(无行为数据则为0)
-            double cfSim = cfSimilarity(targetUsers, spotUsersMap.get(candidate.getId()));
-            // 混合相似度
-            double finalSim = CONTENT_WEIGHT * contentSim + CF_WEIGHT * cfSim;
-
-            // 相似度大于0才纳入候选
-            if (finalSim > 0) {
-                result.add(toRecommendItem(candidate, cityMap, finalSim));
-            }
-        }
-
-        // 5. 按相似度降序排序, 取TOP N
-        result.sort((a, b) -> Double.compare(b.getSimilarity(), a.getSimilarity()));
-        if (result.size() > topN) {
-            result = result.subList(0, topN);
-        }
-        return result;
+        // 一次性加载全部数据并预计算特征/分词(只做一次全表扫描)
+        return computeSimilarFromContext(spotId, topN, loadContext());
     }
 
     // ==================== 猜你喜欢(用户个性化推荐) ====================
@@ -148,6 +97,9 @@ public class RecommendServiceImpl implements RecommendService {
     /**
      * 猜你喜欢: 基于用户历史浏览, 融合内容+CF推荐
      * 冷启动(无浏览记录): 退化为热门推荐
+     *
+     * 性能优化: 对用户的所有浏览景点共享同一份预计算数据(景点特征/分词/城市映射/CF数据),
+     * 只做一次全表扫描, 而不是每个浏览景点都重新加载全量表(避免 10×1.3万 的重复计算)。
      */
     @Override
     public List<RecommendItemResponse> guessYouLike(Integer userId, Integer topN) {
@@ -162,14 +114,17 @@ public class RecommendServiceImpl implements RecommendService {
             return hotRecommended(topN);
         }
 
-        // 2. 对用户浏览过的每个景点, 取其相似TOP20候选, 聚合打分
+        // 2. 一次性加载全部推荐数据并预计算特征/分词, 供所有浏览景点复用
+        RecommendContext ctx = loadContext();
+
+        // 3. 对用户浏览过的每个景点, 取其相似TOP20候选, 聚合打分
         // candidateId -> 累计推荐分
         Map<Integer, Double> candidateScores = new HashMap<>();
         Set<Integer> viewedSpotIds = new HashSet<>();
         for (UserBehavior b : behaviors) {
             viewedSpotIds.add(b.getSpotId());
-            // 复用similarSpots逻辑, 取每个浏览景点的TOP20相似
-            List<RecommendItemResponse> simList = similarSpots(b.getSpotId(), 20);
+            // 复用预计算上下文, 取每个浏览景点的TOP20相似
+            List<RecommendItemResponse> simList = computeSimilarFromContext(b.getSpotId(), 20, ctx);
             for (RecommendItemResponse sim : simList) {
                 // 排除已浏览的
                 if (viewedSpotIds.contains(sim.getId())) {
@@ -180,19 +135,17 @@ public class RecommendServiceImpl implements RecommendService {
             }
         }
 
-        // 3. 按累计推荐分排序, 取TOP N
+        // 4. 按累计推荐分排序, 取TOP N, 并用已缓存数据补全景点信息
         List<Map.Entry<Integer, Double>> sorted = candidateScores.entrySet().stream()
                 .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
                 .limit(topN)
                 .collect(Collectors.toList());
 
-        // 4. 补全景点详情信息
-        Map<Integer, String[]> cityMap = loadCityMap();
         List<RecommendItemResponse> result = new ArrayList<>();
         for (Map.Entry<Integer, Double> entry : sorted) {
-            ScenicSpot spot = scenicSpotMapper.selectById(entry.getKey());
+            ScenicSpot spot = ctx.spotMap.get(entry.getKey());
             if (spot != null) {
-                result.add(toRecommendItem(spot, cityMap, entry.getValue()));
+                result.add(toRecommendItem(spot, ctx.cityMap, entry.getValue()));
             }
         }
 
@@ -342,22 +295,84 @@ public class RecommendServiceImpl implements RecommendService {
     // ==================== 算法核心: 相似度计算 ====================
 
     /**
-     * 内容相似度 = W_FEATURE*特征余弦 + W_PROVINCE*同省份 + W_TEXT*文本Jaccard
+     * 推荐上下文: 一次性加载所有景点及预计算数据, 供多次相似计算复用
+     * 避免在"猜你喜欢"中对每个浏览景点都重新全表扫描+重复分词, 大幅降低耗时
      */
-    private double contentSimilarity(ScenicSpot candidate, double[] targetVec,
+    private static class RecommendContext {
+        List<ScenicSpot> allSpots;
+        Map<Integer, ScenicSpot> spotMap;
+        Map<Integer, String[]> cityMap;
+        Map<Integer, Set<Integer>> spotUsersMap;
+        // 预计算缓存: spotId -> 特征向量 / 分词结果(全流程只算一遍)
+        Map<Integer, double[]> vecCache;
+        Map<Integer, Set<String>> tokCache;
+    }
+
+    /**
+     * 加载并预计算推荐上下文(只做一次DB全表查询 + 一次特征/分词计算)
+     */
+    private RecommendContext loadContext() {
+        RecommendContext ctx = new RecommendContext();
+        ctx.allSpots = scenicSpotMapper.selectList(null);
+        ctx.cityMap = loadCityMap();
+        ctx.spotUsersMap = loadSpotUsersMap();
+        ctx.spotMap = new HashMap<>();
+        ctx.vecCache = new HashMap<>();
+        ctx.tokCache = new HashMap<>();
+        for (ScenicSpot s : ctx.allSpots) {
+            ctx.spotMap.put(s.getId(), s);
+            ctx.vecCache.put(s.getId(), buildFeatureVector(s));
+            ctx.tokCache.put(s.getId(), tokenize(s.getSpotIntro()));
+        }
+        return ctx;
+    }
+
+    /**
+     * 基于共享上下文计算某景点的相似景点TOP N(混合内容+CF), 算法与内容与重构前完全一致
+     */
+    private List<RecommendItemResponse> computeSimilarFromContext(Integer spotId, Integer topN, RecommendContext ctx) {
+        ScenicSpot target = ctx.spotMap.get(spotId);
+        if (target == null) {
+            return Collections.emptyList();
+        }
+        // 直接取预计算的目标景点特征/分词/省份
+        double[] targetVec = ctx.vecCache.get(spotId);
+        Set<String> targetTokens = ctx.tokCache.get(spotId);
+        String targetProvince = getProvince(target.getCityId(), ctx.cityMap);
+        Set<Integer> targetUsers = ctx.spotUsersMap.getOrDefault(spotId, Collections.emptySet());
+
+        // 遍历全量景点, 计算混合相似度(特征/分词均命中缓存, 不再重复计算)
+        List<RecommendItemResponse> result = new ArrayList<>();
+        for (ScenicSpot candidate : ctx.allSpots) {
+            if (candidate.getId().equals(spotId)) {
+                continue;
+            }
+            double contentSim = contextContentSim(candidate, targetVec, targetTokens,
+                    targetProvince, ctx);
+            double cfSim = cfSimilarity(targetUsers, ctx.spotUsersMap.get(candidate.getId()));
+            double finalSim = CONTENT_WEIGHT * contentSim + CF_WEIGHT * cfSim;
+            if (finalSim > 0) {
+                result.add(toRecommendItem(candidate, ctx.cityMap, finalSim));
+            }
+        }
+
+        result.sort((a, b) -> Double.compare(b.getSimilarity(), a.getSimilarity()));
+        if (result.size() > topN) {
+            result = result.subList(0, topN);
+        }
+        return result;
+    }
+
+    /**
+     * 内容相似度 = W_FEATURE*特征余弦 + W_PROVINCE*同省份 + W_TEXT*文本Jaccard
+     * 特征向量与分词结果直接取上下文缓存
+     */
+    private double contextContentSim(ScenicSpot candidate, double[] targetVec,
                                      Set<String> targetTokens, String targetProvince,
-                                     Map<Integer, String[]> cityMap) {
-        // 特征向量余弦相似度
-        double[] candVec = buildFeatureVector(candidate);
-        double featureSim = cosine(targetVec, candVec);
-
-        // 同省份(0或1)
-        double provinceSim = targetProvince.equals(getProvince(candidate.getCityId(), cityMap)) ? 1.0 : 0.0;
-
-        // 介绍文本Jaccard相似度
-        Set<String> candTokens = tokenize(candidate.getSpotIntro());
-        double textSim = jaccard(targetTokens, candTokens);
-
+                                     RecommendContext ctx) {
+        double featureSim = cosine(ctx.vecCache.get(candidate.getId()), targetVec);
+        double provinceSim = targetProvince.equals(getProvince(candidate.getCityId(), ctx.cityMap)) ? 1.0 : 0.0;
+        double textSim = jaccard(ctx.tokCache.get(candidate.getId()), targetTokens);
         return W_FEATURE * featureSim + W_PROVINCE * provinceSim + W_TEXT * textSim;
     }
 

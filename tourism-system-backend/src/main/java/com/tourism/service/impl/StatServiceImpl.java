@@ -3,6 +3,7 @@ package com.tourism.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.tourism.dto.request.SpotQueryRequest;
+import com.tourism.dto.response.ClusterAnalysisResponse;
 import com.tourism.dto.response.KpiResponse;
 import com.tourism.dto.response.PriceScoreResponse;
 import com.tourism.dto.response.ProvinceStackResponse;
@@ -433,5 +434,170 @@ public class StatServiceImpl implements StatService {
         kpi.setLevel5ACount(toLong(row.get("level5a_cnt")));
         kpi.setLevel4APlusCount(toLong(row.get("level4a_plus_cnt")));
         return kpi;
+    }
+
+    // ==================== 数据分析算法: K-Means 景点聚类 ====================
+
+    /**
+     * K-Means聚类分析(无监督学习)
+     *
+     * 算法思路(标准的K-Means两阶段迭代):
+     * 1) 特征选取: 用"门票价格(ticket_price)"与"评分(score)"两个数值维度刻画每个景点;
+     * 2) 数据归一化: 两维量纲差异大(价格0~几百, 评分0~5), 先做 Min-Max 归一化到[0,1],
+     *    避免价格维度主导距离计算, 导致评分维度失效;
+     * 3) 初始化: 随机选取K个样本作为初始聚类中心(centroids);
+     * 4) E步(分配): 计算每个点到所有中心的欧氏距离, 划入距离最近的中心所在簇;
+     * 5) M步(更新): 重新计算每个簇内样本的均值作为新中心;
+     * 6) 重复4/5直到中心不再变化(或达到最大迭代次数), 算法收敛;
+     * 7) 结果: 返回每个景点的簇编号、簇中心(还原为原始量纲)及各簇规模。
+     *
+     * 数据规模控制: 全量1.3万景点迭代开销大, 且聚类散点过密影响视觉,
+     * 故随机采样 sampleSize 个点参与聚类, 分布形状基本保持不变(与散点图口径一致)。
+     *
+     * @param query      筛选条件(省份/类型等, 在筛选范围内聚类)
+     * @param sampleSize 采样样本数(默认800)
+     * @param k          聚类簇数(默认4)
+     */
+    @Override
+    public ClusterAnalysisResponse clusterAnalysis(SpotQueryRequest query, Integer sampleSize, Integer k) {
+        int sample = (sampleSize == null || sampleSize <= 0) ? 800 : Math.min(sampleSize, 5000);
+        int K = (k == null || k <= 0) ? 4 : Math.max(2, Math.min(k, 8));
+
+        // 1) 查询参与聚类的景点(只取价格/评分/名称, 随机采样)
+        LambdaQueryWrapper<ScenicSpot> wrapper = buildSpotWrapper(query);
+        wrapper.isNotNull(ScenicSpot::getTicketPrice)
+                .isNotNull(ScenicSpot::getScore)
+                .select(ScenicSpot::getTicketPrice, ScenicSpot::getScore, ScenicSpot::getSpotName)
+                .last("ORDER BY RAND() LIMIT " + sample);
+        List<ScenicSpot> spots = scenicSpotMapper.selectList(wrapper);
+        if (spots.isEmpty()) {
+            return new ClusterAnalysisResponse(Collections.emptyList(), Collections.emptyList(), Collections.emptyList());
+        }
+
+        int n = spots.size();
+        // 原始特征数组
+        double[] price = new double[n];
+        double[] score = new double[n];
+        for (int i = 0; i < n; i++) {
+            price[i] = spots.get(i).getTicketPrice() == null ? 0.0 : spots.get(i).getTicketPrice().doubleValue();
+            score[i] = spots.get(i).getScore() == null ? 0.0 : spots.get(i).getScore().doubleValue();
+        }
+
+        // 2) Min-Max 归一化(找到两维各自最小/最大值)
+        double minPrice = Double.MAX_VALUE, maxPrice = -Double.MAX_VALUE;
+        double minScore = Double.MAX_VALUE, maxScore = -Double.MAX_VALUE;
+        for (int i = 0; i < n; i++) {
+            minPrice = Math.min(minPrice, price[i]);
+            maxPrice = Math.max(maxPrice, price[i]);
+            minScore = Math.min(minScore, score[i]);
+            maxScore = Math.max(maxScore, score[i]);
+        }
+        // 防止某维全相等导致分母为0
+        double priceSpan = maxPrice - minPrice;
+        double scoreSpan = maxScore - minScore;
+        double[][] norm = new double[n][2]; // 归一化后的特征(价格,评分)
+        for (int i = 0; i < n; i++) {
+            norm[i][0] = priceSpan == 0 ? 0.5 : (price[i] - minPrice) / priceSpan;
+            norm[i][1] = scoreSpan == 0 ? 0.5 : (score[i] - minScore) / scoreSpan;
+        }
+
+        // 3) 随机初始化K个聚类中心(直接从样本里挑K个不同的点)
+        List<Integer> initIdx = new ArrayList<>();
+        Random rand = new Random();
+        while (initIdx.size() < Math.min(K, n)) {
+            int idx = rand.nextInt(n);
+            if (!initIdx.contains(idx)) {
+                initIdx.add(idx);
+            }
+        }
+        double[][] centroids = new double[initIdx.size()][2];
+        for (int c = 0; c < initIdx.size(); c++) {
+            int idx = initIdx.get(c);
+            centroids[c][0] = norm[idx][0];
+            centroids[c][1] = norm[idx][1];
+        }
+        int actualK = initIdx.size();
+
+        // 4) 迭代: E步(分配) + M步(更新中心)
+        int[] assignment = new int[n];
+        for (int iter = 0; iter < 100; iter++) {
+            boolean changed = false;
+            // E步: 每个样本划入最近的中心
+            for (int i = 0; i < n; i++) {
+                int best = 0;
+                double bestDist = Double.MAX_VALUE;
+                for (int c = 0; c < actualK; c++) {
+                    double dx = norm[i][0] - centroids[c][0];
+                    double dy = norm[i][1] - centroids[c][1];
+                    double d = dx * dx + dy * dy;
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = c;
+                    }
+                }
+                if (assignment[i] != best) {
+                    assignment[i] = best;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                break; // 分配不再变化, 已收敛
+            }
+            // M步: 重新计算每个簇的均值中心
+            double[][] sum = new double[actualK][2];
+            int[] cnt = new int[actualK];
+            for (int i = 0; i < n; i++) {
+                int c = assignment[i];
+                sum[c][0] += norm[i][0];
+                sum[c][1] += norm[i][1];
+                cnt[c]++;
+            }
+            for (int c = 0; c < actualK; c++) {
+                if (cnt[c] > 0) {
+                    centroids[c][0] = sum[c][0] / cnt[c];
+                    centroids[c][1] = sum[c][1] / cnt[c];
+                }
+            }
+        }
+
+        // 5) 组装结果
+        List<ClusterAnalysisResponse.Point> points = new ArrayList<>();
+        int[] sizes = new int[actualK];
+        for (int i = 0; i < n; i++) {
+            int c = assignment[i];
+            sizes[c]++;
+            points.add(new ClusterAnalysisResponse.Point(
+                    spots.get(i).getSpotName(),
+                    price[i], score[i], c));
+        }
+
+        // 中心点还原为原始量纲, 并按"价格×评分"大致命名簇(便于大屏图例理解)
+        List<ClusterAnalysisResponse.Centroid> centroidList = new ArrayList<>();
+        for (int c = 0; c < actualK; c++) {
+            double centerPrice = priceSpan == 0 ? minPrice : minPrice + centroids[c][0] * priceSpan;
+            double centerScore = scoreSpan == 0 ? minScore : minScore + centroids[c][1] * scoreSpan;
+            centroidList.add(new ClusterAnalysisResponse.Centroid(
+                    c,
+                    describeCluster(centerPrice, centerScore),
+                    Math.round(centerPrice * 100) / 100.0,
+                    Math.round(centerScore * 100) / 100.0));
+        }
+        // 按簇规模从大到小排序返回, 前端据此给颜色
+        List<Integer> sizeList = new ArrayList<>();
+        for (int c = 0; c < actualK; c++) {
+            sizeList.add(sizes[c]);
+        }
+        return new ClusterAnalysisResponse(points, centroidList, sizeList);
+    }
+
+    /**
+     * 根据簇中心(价格,评分)给出业务语义描述, 便于答辩/展示解释聚类含义
+     */
+    private String describeCluster(double price, double score) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(score >= 4.2 ? "高评分" : score >= 3.5 ? "中评分" : "低评分");
+        sb.append("·");
+        sb.append(price >= 150 ? "高消费" : price >= 50 ? "中档消费" : "实惠");
+        return sb.toString();
     }
 }

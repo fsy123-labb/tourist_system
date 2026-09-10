@@ -90,6 +90,15 @@
         </el-card>
       </div>
 
+      <!-- 数据分析算法一：K-Means 景点聚类 -->
+      <div class="chart-row">
+        <el-card class="chart-card">
+          <div class="chart-title">K-Means 景点聚类分析（价格·评分）</div>
+          <div class="cluster-desc">按门票价格与评分两维特征对景点做无监督聚类（Min-Max 归一化 + 欧氏距离迭代），不同颜色代表不同消费客群。圆形标记为各类簇中心。</div>
+          <div ref="clusterChartRef" class="chart"></div>
+        </el-card>
+      </div>
+
       <!-- 新增行2：各省总销量 + 等级×省份堆叠 -->
       <div class="chart-row">
         <el-card class="chart-card">
@@ -118,7 +127,7 @@ import * as echarts from 'echarts'
 import chinaJson from '@/assets/china.json'
 import { getProvinces } from '@/api/city.js'
 // 导入统计API
-import { getProvinceCount, getTypeCount, getPriceScoreData, getHotSalesTop, getPriceRange, getAvgPriceByProvince, getSalesSumByProvince, getProvinceLevelStack, getKpiOverview } from '@/api/stat.js'
+import { getProvinceCount, getTypeCount, getPriceScoreData, getHotSalesTop, getPriceRange, getAvgPriceByProvince, getSalesSumByProvince, getProvinceLevelStack, getKpiOverview, getClusterAnalysis } from '@/api/stat.js'
 
 // 筛选表单(必须在computed之前声明)
 const filterForm = reactive({
@@ -142,6 +151,8 @@ const priceRangeRef = ref(null)
 const avgPriceRef = ref(null)
 const salesSumRef = ref(null)
 const stackRef = ref(null)
+// K-Means聚类图ref
+const clusterChartRef = ref(null)
 
 // KPI概览数据(顶部数字卡片)
 const kpiData = ref({
@@ -164,6 +175,8 @@ let priceRangeChart = null
 let avgPriceChart = null
 let salesSumChart = null
 let stackChart = null
+// K-Means聚类图实例
+let clusterChart = null
 
 const provinceOptions = ref([])
 const spotTypes = ['5A景区', '4A景区', '3A景区', '未评级']
@@ -197,6 +210,7 @@ async function loadAllData() {
   loadAvgPrice()
   loadSalesSum()
   loadStack()
+  loadCluster()
 }
 
 // 省份柱状图 (选了省份时只展示该省一条, 否则 TOP15)
@@ -582,6 +596,65 @@ async function loadStack() {
   }
 }
 
+// K-Means聚类分析散点图(价格x, 评分y, 按簇着色 + 标绘中心点)
+async function loadCluster() {
+  try {
+    const res = await getClusterAnalysis({ ...filterForm, sampleSize: 800, k: 4 })
+    if (!res || !res.points) {
+      clusterChart = echarts.init(clusterChartRef.value)
+      return
+    }
+    // 按簇编号分组, 每种簇一种颜色
+    const clusterColors = ['#5470c6', '#ee6666', '#91cc75', '#fac858', '#9a60b4', '#73c0de', '#3ba272', '#fc8452']
+    // 按时簇规模统计簇数量, 用作series顺序(保证图例与颜色对应)
+    const kCount = (res.centroids || []).length || Math.max(...res.points.map(p => p.clusterId)) + 1
+    const series = []
+    // 每个簇一条scatter series
+    for (let c = 0; c < kCount; c++) {
+      const pts = res.points.filter(p => p.clusterId === c)
+      series.push({
+        name: (res.centroids[c]?.clusterName) || `簇${c}`,
+        type: 'scatter',
+        data: pts.map(p => [p.price, p.score, p.name]),
+        symbolSize: 9,
+        itemStyle: { color: clusterColors[c % clusterColors.length], opacity: 0.75 }
+      })
+    }
+    // 追加聚类中心点(大圆点+菱形)
+    if (res.centroids && res.centroids.length) {
+      series.push({
+        name: '聚类中心',
+        type: 'scatter',
+        data: res.centroids.map(cn => [cn.price, cn.score, cn.clusterName]),
+        symbolSize: 15,
+        symbol: 'diamond',
+        itemStyle: { color: '#333', borderColor: '#fff', borderWidth: 2 },
+        label: { show: true, formatter: '{c}', position: 'top', fontSize: 10, color: '#333' }
+      })
+    }
+
+    clusterChart = echarts.init(clusterChartRef.value)
+    const option = {
+      // 右上角图例, 展示各簇名
+      legend: { top: 0, type: 'scroll', textStyle: { fontSize: 11 } },
+      grid: { left: 50, right: 25, top: 40, bottom: 45 },
+      tooltip: {
+        trigger: 'item',
+        formatter: (params) => {
+          const d = params.data
+          return `${d[2]}<br/>门票: ¥${d[0]}<br/>评分: ${d[1]}`
+        }
+      },
+      xAxis: { type: 'value', name: '门票价格(元)', nameTextStyle: { fontSize: 11 } },
+      yAxis: { type: 'value', name: '评分', min: 0, max: 5, nameTextStyle: { fontSize: 11 } },
+      series
+    }
+    clusterChart.setOption(option)
+  } catch (err) {
+    console.error('加载K-Means聚类图失败:', err)
+  }
+}
+
 // 窗口大小变化时重新渲染图表
 function handleResize() {
   barChart?.resize()
@@ -593,6 +666,7 @@ function handleResize() {
   avgPriceChart?.resize()
   salesSumChart?.resize()
   stackChart?.resize()
+  clusterChart?.resize()
 }
 
 onMounted(async () => {
@@ -618,6 +692,7 @@ onUnmounted(() => {
   avgPriceChart?.dispose()
   salesSumChart?.dispose()
   stackChart?.dispose()
+  clusterChart?.dispose()
 })
 </script>
 
@@ -662,6 +737,14 @@ onUnmounted(() => {
 .chart {
   width: 100%;
   height: 320px;
+}
+
+/* K-Means聚类图说明文字 */
+.cluster-desc {
+  font-size: 12px;
+  color: #909399;
+  margin-bottom: 8px;
+  line-height: 1.5;
 }
 
 .map-card {

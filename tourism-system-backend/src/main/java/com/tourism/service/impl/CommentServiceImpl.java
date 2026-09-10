@@ -101,14 +101,27 @@ public class CommentServiceImpl implements CommentService {
     }
 
     /**
-     * 管理员审核: 查询全部评论(支持按景点/用户筛选)
+     * 管理员审核: 查询全部评论(支持按景点名称/景点ID/用户ID筛选)
      */
     @Override
-    public Page<CommentResponse> listAll(Integer spotId, Integer userId, Long current, Long size) {
+    public Page<CommentResponse> listAll(Integer spotId, String spotName, Integer userId, Long current, Long size) {
         Page<SpotComment> page = new Page<>(current, size);
         LambdaQueryWrapper<SpotComment> wrapper = new LambdaQueryWrapper<SpotComment>()
                 .orderByDesc(SpotComment::getCreateTime);
-        // 按景点筛选
+        // 按景点名称模糊筛选: 先查出名称匹配的景点ID集合, 再用ID过滤评论
+        if (spotName != null && !spotName.trim().isEmpty()) {
+            List<Integer> matchedIds = scenicSpotMapper.selectList(
+                    new LambdaQueryWrapper<ScenicSpot>()
+                            .like(ScenicSpot::getSpotName, spotName.trim())
+                            .select(ScenicSpot::getId))
+                    .stream().map(ScenicSpot::getId).collect(Collectors.toList());
+            // 无匹配景点时直接返回空页, 避免 in(空集合) 生成非法SQL
+            if (matchedIds.isEmpty()) {
+                return convertPage(page, false, false);
+            }
+            wrapper.in(SpotComment::getSpotId, matchedIds);
+        }
+        // 按景点ID筛选
         if (spotId != null) {
             wrapper.eq(SpotComment::getSpotId, spotId);
         }

@@ -2,6 +2,7 @@ package com.tourism.controller;
 
 import com.tourism.common.Result;
 import com.tourism.dto.request.SpotQueryRequest;
+import com.tourism.dto.response.ClusterAnalysisResponse;
 import com.tourism.dto.response.KpiResponse;
 import com.tourism.dto.response.PriceScoreResponse;
 import com.tourism.dto.response.ProvinceStackResponse;
@@ -113,6 +114,19 @@ public class StatController {
     @GetMapping("/kpiOverview")
     public Result<KpiResponse> kpiOverview(SpotQueryRequest query) {
         KpiResponse result = statService.kpiOverview(query);
+        return Result.success(result);
+    }
+
+    /**
+     * K-Means聚类分析(景点按价格-评分聚类, 无监督学习算法)
+     * GET /api/stat/clusterAnalysis?sampleSize=800&k=4
+     */
+    @GetMapping("/clusterAnalysis")
+    public Result<ClusterAnalysisResponse> clusterAnalysis(
+            SpotQueryRequest query,
+            @RequestParam(defaultValue = "800") Integer sampleSize,
+            @RequestParam(defaultValue = "4") Integer k) {
+        ClusterAnalysisResponse result = statService.clusterAnalysis(query, sampleSize, k);
         return Result.success(result);
     }
 }

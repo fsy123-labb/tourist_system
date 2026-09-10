@@ -42,14 +42,15 @@ public interface CommentService {
     void delete(Integer userId, Long commentId);
 
     /**
-     * 管理员审核: 分页查询全部评论(支持按景点/用户筛选)
+     * 管理员审核: 分页查询全部评论(支持按景点名称/景点ID/用户ID筛选)
      * @param spotId 景点ID(可选, null=不限)
+     * @param spotName 景点名称(可选, 模糊匹配, null=不限)
      * @param userId 用户ID(可选, null=不限)
      * @param current 当前页
      * @param size 每页大小
      * @return 评论分页(含用户名+景点名)
      */
-    Page<CommentResponse> listAll(Integer spotId, Integer userId, Long current, Long size);
+    Page<CommentResponse> listAll(Integer spotId, String spotName, Integer userId, Long current, Long size);
 
     /**
      * 管理员删除任意评论(无需作者校验)
