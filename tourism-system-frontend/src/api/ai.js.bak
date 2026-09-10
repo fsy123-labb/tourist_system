@@ -53,19 +53,7 @@ export function chatWithAIStream({ message, history = [], onChunk, onError, onDo
             onError && onError(json.error)
             return
           }
-          // 处理新事件格式: {type, content, meta}
-          if (json.type === 'thinking') {
-            onThinking && onThinking(json.step, json.content)
-          } else if (json.type === 'content') {
-            onChunk && onChunk(json.content)
-          } else if (json.type === 'predict') {
-            onPredict && onPredict(json.content)
-          } else if (json.type === 'error') {
-            onError && onError(json.content)
-          } else if (json.type === 'done') {
-            onDone && onDone(json.meta)
-          } else if (json.content) {
-            // 兼容旧格式
+          if (json.content) {
             onChunk && onChunk(json.content)
           }
         } catch (e) {

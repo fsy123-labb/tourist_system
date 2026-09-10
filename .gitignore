@@ -25,6 +25,12 @@ Desktop.ini
 # Logs
 *.log
 
+# Python AI Agent
+__pycache__/
+*.pyc
+*.pyo
+.env
+
 # 论文/文档材料(不入代码仓库)
 _report_work/
 课程实训报告-基于大数据的全国旅游景点信息管理系统.docx
